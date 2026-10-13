@@ -1,0 +1,21 @@
+# ==============================================================================
+# Talk2Tables: Python Dependencies
+#
+# Install with:
+#     pip install -r requirements.txt
+# ==============================================================================
+
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]
+asyncpg
+aiosqlite
+aiomysql
+cryptography
+openai
+redis
+python-dotenv
+numpy
+streamlit
+azure-storage-blob
+aiohttp

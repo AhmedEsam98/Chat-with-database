@@ -1,0 +1,59 @@
+# ==============================================================================
+# Docker Compose: Full-stack Talk2Tables Services
+# Orchestrates FastAPI backend (:8000), Streamlit Web UI (:8501), and Redis (:6379).
+#
+# Run with:
+#     docker-compose up -d --build
+#
+# Stop with:
+#     docker-compose down
+#
+# View logs:
+#     docker-compose logs -f
+# ==============================================================================
+
+services:
+
+  api:
+    build: .
+    container_name: chatbot-api
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  web:
+    build: .
+    container_name: chatbot-web
+    command: ["streamlit", "run", "app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./:/app
+    ports:
+      - "8501:8501"
+    depends_on:
+      - redis
+      - api
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: chatbot-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:
