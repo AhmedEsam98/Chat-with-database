@@ -129,7 +129,7 @@ def set_database_connection(url: str, label: str | None = None) -> None:
 
 
 def get_engine() -> AsyncEngine:
-    """Return an async engine bound to the current running event loop using connection pooling."""
+    """Return an async engine bound to the current running event loop using NullPool."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -137,20 +137,11 @@ def get_engine() -> AsyncEngine:
 
     eng = _engines.get(loop)
     if eng is None:
-        if _current_dialect == "sqlite":
-            eng = create_async_engine(
-                _current_url,
-                poolclass=NullPool,
-                pool_pre_ping=True,
-            )
-        else:
-            eng = create_async_engine(
-                _current_url,
-                pool_size=config.DB_POOL_SIZE,
-                max_overflow=config.DB_MAX_OVERFLOW,
-                pool_pre_ping=True,
-                pool_recycle=300,
-            )
+        eng = create_async_engine(
+            _current_url,
+            poolclass=NullPool,
+            pool_pre_ping=True,
+        )
         _engines[loop] = eng
     return eng
 
