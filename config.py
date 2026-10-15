@@ -13,6 +13,25 @@ from dotenv import load_dotenv
 load_dotenv(override=False)
 
 
+def reload_env() -> str | None:
+    """Reload the .env file with override=True to capture any runtime changes."""
+    global DATABASE_URL, AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT
+    load_dotenv(override=True)
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+    AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://gbg-ai-2.openai.azure.com/")
+    return DATABASE_URL
+
+
+def get_default_db_url() -> str:
+    """Return the default database URL from .env, refreshing if needed."""
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        reload_env()
+        url = os.getenv("DATABASE_URL")
+    return url or "sqlite+aiosqlite:///:memory:"
+
+
 # ---------------------------------------------------------------------------
 # Azure OpenAI Settings
 # ---------------------------------------------------------------------------

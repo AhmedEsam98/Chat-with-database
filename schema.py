@@ -21,11 +21,13 @@ _SKIP_SUFFIXES = ("Id", "id")
 _SKIP_NAMES = {
     "Fax", "Phone", "PostalCode", "Email", "Address",
     "BillingAddress", "BillingPostalCode", "Password", "PasswordHash",
+    "Composer", "Name", "Title", "FirstName", "LastName", "Company",
+    "Description", "Notes", "Bio", "Comment", "Comments", "Review",
 }
 
 
 def _should_sample(column_name: str, data_type: str) -> bool:
-    """Decide whether to show sample values for this column."""
+    """Decide whether to show sample values for this column (prioritizing categories/codes)."""
     dt_lower = data_type.lower()
     text_indicators = ("char", "text", "varchar", "string", "nvarchar", "user-defined")
     if not any(ti in dt_lower for ti in text_indicators):
@@ -60,13 +62,19 @@ async def get_schema_prompt() -> str:
     for col in columns_info:
         tables[col["table_name"]].append(col)
 
-    # Fetch sample values for text columns concurrently
+    # Fetch sample values with controlled concurrency to avoid socket throttling
+    sem = asyncio.Semaphore(4)
+
+    async def _safe_fetch(t_name: str, c_name: str):
+        async with sem:
+            return await fetch_distinct_values(t_name, c_name, limit=15)
+
     sample_tasks = []
     task_keys = []
     for table_name, cols in tables.items():
         for col in cols:
             if _should_sample(col["column_name"], col["data_type"]):
-                sample_tasks.append(fetch_distinct_values(table_name, col["column_name"], limit=20))
+                sample_tasks.append(_safe_fetch(table_name, col["column_name"]))
                 task_keys.append((table_name, col["column_name"]))
 
     results = await asyncio.gather(*sample_tasks, return_exceptions=True)

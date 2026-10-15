@@ -29,6 +29,8 @@ from db import (
     set_database_connection,
     get_active_dialect,
     get_active_connection_info,
+    get_active_raw_url,
+    resolve_masked_url,
     fetch_schema_info,
 )
 from llm import generate_sql, generate_answer, rewrite_question, explain_sql
@@ -69,6 +71,24 @@ async def run_pipeline(
         duration = time.perf_counter() - start_time
         return error_msg, None, None, False, None, {"total_s": duration, "db_ms": 0.0, "source": "guardrail"}
 
+    # 0.1 Fast-path for greetings & casual pleasantries
+    q_clean = question.strip().lower().rstrip("!?.,")
+    greetings = {
+        "hi", "hello", "hey", "hola", "good morning", "good afternoon",
+        "good evening", "how are you", "how are you doing", "what's up",
+        "whats up", "greetings", "help",
+    }
+    if q_clean in greetings:
+        duration = time.perf_counter() - start_time
+        return (
+            "Hello! I am your AI database assistant. Ask me questions about your connected tables, analytics, or summaries.",
+            None,
+            None,
+            False,
+            None,
+            {"total_s": duration, "db_ms": 0.0, "llm_s": 0.0, "source": "greeting"},
+        )
+
     # 1. Semantic Redis vector cache lookup
     if enable_semantic_cache:
         semantic_cached = await get_semantic_cached_answer(
@@ -78,16 +98,19 @@ async def run_pipeline(
             duration = time.perf_counter() - start_time
             return semantic_cached, None, None, True, None, {"total_s": duration, "db_ms": 0.0, "source": "cache"}
 
+    total_llm_time = 0.0
+
     # 2. Rewrite the question for better SQL generation
     if enable_query_rewrite:
+        t_rw0 = time.perf_counter()
         rewritten = await rewrite_question(question, model=model, temperature=temperature)
+        total_llm_time += (time.perf_counter() - t_rw0)
     else:
         rewritten = question
 
     # 3. Text-to-SQL with self-correction
     last_sql = None
     history = []
-    total_llm_time = 0.0
     for _ in range(max_sql_attempts):
         t_llm1 = time.perf_counter()
         sql = await generate_sql(rewritten, history=history, model=model, temperature=temperature)
@@ -166,6 +189,14 @@ if "semantic_threshold" not in st.session_state:
     st.session_state.semantic_threshold = config.SEMANTIC_SIMILARITY_THRESHOLD
 if "enable_query_rewrite" not in st.session_state:
     st.session_state.enable_query_rewrite = config.ENABLE_QUERY_REWRITE
+if "db_uri_input" not in st.session_state:
+    st.session_state.db_uri_input = get_active_raw_url()
+if "db_connected" not in st.session_state:
+    st.session_state.db_connected = None
+if "db_status_msg" not in st.session_state:
+    st.session_state.db_status_msg = None
+if "schema_cols" not in st.session_state:
+    st.session_state.schema_cols = None
 
 
 def _get_or_create_event_loop() -> asyncio.AbstractEventLoop:
@@ -243,30 +274,95 @@ with st.sidebar:
     # --- SECTION 1: DATABASE CONNECTION (URI) ---
     with st.expander("🗄️ Database Connection (URI)", expanded=True):
         loop = _get_or_create_event_loop()
-        try:
-            db_connected, db_status_msg = loop.run_until_complete(test_db_connection())
-        except Exception as e:
-            db_connected, db_status_msg = False, str(e)
+
+        def _on_use_demo_db():
+            demo_path = os.path.join("data", "sample_ecommerce.db")
+            demo_url, _ = config.normalize_db_url(f"sqlite+aiosqlite:///{demo_path}")
+            set_database_connection(demo_url, "SQLite Demo (sample_ecommerce.db)")
+            st.session_state.db_uri_input = demo_url
+            st.session_state.db_connected = True
+            st.session_state.db_status_msg = "Connected"
+            st.session_state.schema_cols = None
+            st.session_state.messages = []
+            st.session_state.flash_msg = ("success", "Connected to sample SQLite database!")
+
+        def _on_connect_db():
+            curr_uri = st.session_state.get("db_uri_input", "").strip()
+            resolved = resolve_masked_url(curr_uri)
+            target, dialect = config.normalize_db_url(resolved)
+            t_label = f"{dialect.upper()} Database"
+
+            ev_loop = _get_or_create_event_loop()
+            t0 = time.perf_counter()
+            ok, msg = ev_loop.run_until_complete(test_db_connection(target))
+            lat_ms = (time.perf_counter() - t0) * 1000
+
+            if ok:
+                set_database_connection(target, t_label)
+                st.session_state.db_uri_input = target
+                st.session_state.db_connected = True
+                st.session_state.db_status_msg = "Connected"
+                st.session_state.schema_cols = None
+                st.session_state.messages = []
+                st.session_state.flash_msg = ("success", f"Connected to {t_label}! ⏱️ `{lat_ms:.1f}ms`")
+            else:
+                st.session_state.db_connected = False
+                st.session_state.db_status_msg = msg
+                st.session_state.flash_msg = ("error", f"Could not connect: {msg}")
+
+        def _on_reset_to_default():
+            config.reload_env()
+            def_url = config.get_default_db_url()
+            norm, dialect = config.normalize_db_url(def_url)
+            lbl = f"{dialect.upper()} (Default .env)"
+
+            ev_loop = _get_or_create_event_loop()
+            ok, msg = ev_loop.run_until_complete(test_db_connection(norm))
+            set_database_connection(norm, lbl)
+            st.session_state.db_uri_input = norm
+            st.session_state.db_connected = ok
+            st.session_state.db_status_msg = msg if not ok else "Connected"
+            st.session_state.schema_cols = None
+            st.session_state.messages = []
+
+            if ok:
+                st.session_state.flash_msg = ("success", f"Reset and connected to {lbl}!")
+            else:
+                st.session_state.flash_msg = ("error", f"Reset to default (.env), but connection test failed: {msg}")
+
+        # Check or cache connection status to avoid blocking every Streamlit rerun
+        if st.session_state.get("db_connected") is None:
+            try:
+                db_connected, db_status_msg = loop.run_until_complete(test_db_connection())
+                st.session_state.db_connected = db_connected
+                st.session_state.db_status_msg = db_status_msg
+            except Exception as e:
+                st.session_state.db_connected = False
+                st.session_state.db_status_msg = str(e)
 
         active_info = get_active_connection_info()
 
-        if db_connected:
+        if st.session_state.db_connected:
             st.success(f"🟢 **{active_info['label']}** (Connected)")
         else:
-            st.error(f"🔴 **Disconnected**: {db_status_msg}")
+            st.error(f"🔴 **Disconnected**: {st.session_state.db_status_msg}")
+
+        # Display flash notifications from callbacks
+        if "flash_msg" in st.session_state and st.session_state.flash_msg:
+            fl_level, fl_text = st.session_state.pop("flash_msg")
+            if fl_level == "success":
+                st.success(fl_text)
+            else:
+                st.error(fl_text)
 
         demo_db_path = os.path.join("data", "sample_ecommerce.db")
         if os.path.exists(demo_db_path):
-            if st.button("📦 Use Built-in Demo E-Commerce SQLite DB", use_container_width=True):
-                demo_url, _ = config.normalize_db_url(f"sqlite+aiosqlite:///{demo_db_path}")
-                set_database_connection(demo_url, "SQLite Demo (sample_ecommerce.db)")
-                st.session_state.messages = []
-                st.success("Connected to sample SQLite database!")
-                st.rerun()
+            st.button("📦 Use Built-in Demo E-Commerce SQLite DB", on_click=_on_use_demo_db, use_container_width=True)
 
+        # Bind with key="db_uri_input" so reset and manual edits keep state in sync
         raw_uri = st.text_area(
             "Database Connection URI",
-            value=active_info.get("url", config.DATABASE_URL or f"sqlite+aiosqlite:///{demo_db_path}"),
+            key="db_uri_input",
             help="Supports PostgreSQL (postgresql+asyncpg://), MySQL (mysql+aiomysql://), SQLite (sqlite+aiosqlite:///), and MSSQL.",
             placeholder="postgresql+asyncpg://user:password@localhost:5432/dbname",
         )
@@ -279,8 +375,8 @@ with st.sidebar:
             "- MSSQL: `mssql+aioodbc://user:pass@host:1433/dbname`"
         )
 
-        target_url, target_dialect = config.normalize_db_url(raw_uri)
-        target_label = f"{target_dialect.upper()} Database"
+        resolved_uri = resolve_masked_url(raw_uri)
+        target_url, target_dialect = config.normalize_db_url(resolved_uri)
 
         # Action Buttons
         col_test, col_connect = st.columns(2)
@@ -289,35 +385,24 @@ with st.sidebar:
                 t_test0 = time.perf_counter()
                 test_ok, test_msg = loop.run_until_complete(test_db_connection(target_url))
                 test_latency_ms = (time.perf_counter() - t_test0) * 1000
+                st.session_state.db_connected = test_ok
+                st.session_state.db_status_msg = test_msg if not test_ok else "Connected"
                 if test_ok:
                     st.success(f"✅ Connected! ⏱️ `{test_latency_ms:.1f}ms`")
                 else:
                     st.error(f"❌ Failed: {test_msg} (⏱️ `{test_latency_ms:.1f}ms`)")
 
         with col_connect:
-            if st.button("💾 Connect DB", use_container_width=True, type="primary"):
-                t_conn0 = time.perf_counter()
-                test_ok, test_msg = loop.run_until_complete(test_db_connection(target_url))
-                conn_latency_ms = (time.perf_counter() - t_conn0) * 1000
-                if test_ok:
-                    set_database_connection(target_url, target_label)
-                    st.session_state.messages = []
-                    st.success(f"Connected to {target_label}! ⏱️ `{conn_latency_ms:.1f}ms`")
-                    st.rerun()
-                else:
-                    st.error(f"Could not connect: {test_msg}")
+            st.button("💾 Connect DB", on_click=_on_connect_db, use_container_width=True, type="primary")
 
-        if st.button("🔄 Reset to Default (.env)", use_container_width=True):
-            default_url = config.DATABASE_URL or "sqlite+aiosqlite:///:memory:"
-            set_database_connection(default_url, "Default Database")
-            st.session_state.messages = []
-            st.success("Reset to default database!")
-            st.rerun()
+        st.button("🔄 Reset to Default (.env)", on_click=_on_reset_to_default, use_container_width=True)
 
     # --- SECTION 2: INTROSPECTED TABLES & SCHEMA ---
     with st.expander("📋 Introspected Tables & Schema", expanded=False):
         try:
-            schema_cols = loop.run_until_complete(fetch_schema_info())
+            if st.session_state.get("schema_cols") is None and st.session_state.get("db_connected"):
+                st.session_state.schema_cols = loop.run_until_complete(fetch_schema_info())
+            schema_cols = st.session_state.get("schema_cols")
             if schema_cols:
                 from collections import defaultdict
                 tables_map = defaultdict(list)
@@ -326,6 +411,8 @@ with st.sidebar:
                 st.caption(f"Dialect: **{get_active_dialect()}** | Tables: **{len(tables_map)}**")
                 for t_name, cols in sorted(tables_map.items()):
                     st.markdown(f"**`{t_name}`** ({', '.join(cols)})")
+            elif not st.session_state.get("db_connected"):
+                st.caption("Database disconnected. Connect to view tables.")
             else:
                 st.caption("No user tables detected.")
         except Exception as e:

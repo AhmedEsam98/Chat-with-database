@@ -45,6 +45,34 @@ def get_active_dialect() -> str:
     return _current_dialect
 
 
+def get_active_raw_url() -> str:
+    """Return the unmasked active database URL."""
+    return _current_url
+
+
+def resolve_masked_url(url: str | None) -> str:
+    """If url contains '****' (e.g. copied from masked UI), restore password from current active URL or default .env URL."""
+    if not url:
+        return url or ""
+    clean_url = url.strip()
+    if ":****@" not in clean_url and ":***@" not in clean_url:
+        return clean_url
+
+    candidates = [_current_url, config.get_default_db_url()]
+    for cand in candidates:
+        if cand and "@" in cand and "://" in cand:
+            try:
+                cand_rest = cand.split("://", 1)[1]
+                cand_user_pass = cand_rest.split("@", 1)[0]
+                if ":" in cand_user_pass:
+                    real_pass = cand_user_pass.split(":", 1)[1]
+                    clean_url = re.sub(r":\*{3,}@", f":{real_pass}@", clean_url)
+                    break
+            except Exception:
+                pass
+    return clean_url
+
+
 def get_active_connection_info() -> dict:
     """Return sanitized connection info for UI display."""
     url = _current_url
@@ -68,18 +96,29 @@ def get_active_connection_info() -> dict:
 def set_database_connection(url: str, label: str | None = None) -> None:
     """Switch active database connection and dispose previous engine instances."""
     global _current_url, _current_dialect, _current_label
-    normalized_url, dialect = config.normalize_db_url(url)
+    resolved = resolve_masked_url(url)
+    normalized_url, dialect = config.normalize_db_url(resolved)
     _current_url = normalized_url
     _current_dialect = dialect
-    _current_label = label or f"{dialect.upper()} Connection"
+    _current_label = label or f"{dialect.upper()} Database"
 
-    # Dispose old engines
-    for eng in _engines.values():
-        try:
-            eng.sync_engine.dispose()
-        except Exception:
-            pass
+    # Dispose old engines properly via async dispose
+    old_engines = list(_engines.values())
     _engines.clear()
+
+    if old_engines:
+        try:
+            loop = asyncio.get_running_loop()
+            for old_eng in old_engines:
+                loop.create_task(old_eng.dispose())
+        except RuntimeError:
+            try:
+                loop = asyncio.new_event_loop()
+                for old_eng in old_engines:
+                    loop.run_until_complete(old_eng.dispose())
+                loop.close()
+            except Exception:
+                pass
 
     # Invalidate schema prompt cache if schema module is loaded
     try:
@@ -90,7 +129,7 @@ def set_database_connection(url: str, label: str | None = None) -> None:
 
 
 def get_engine() -> AsyncEngine:
-    """Return an async engine bound to the current running event loop using NullPool."""
+    """Return an async engine bound to the current running event loop using connection pooling."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -98,11 +137,20 @@ def get_engine() -> AsyncEngine:
 
     eng = _engines.get(loop)
     if eng is None:
-        eng = create_async_engine(
-            _current_url,
-            poolclass=NullPool,
-            pool_pre_ping=True,
-        )
+        if _current_dialect == "sqlite":
+            eng = create_async_engine(
+                _current_url,
+                poolclass=NullPool,
+                pool_pre_ping=True,
+            )
+        else:
+            eng = create_async_engine(
+                _current_url,
+                pool_size=config.DB_POOL_SIZE,
+                max_overflow=config.DB_MAX_OVERFLOW,
+                pool_pre_ping=True,
+                pool_recycle=300,
+            )
         _engines[loop] = eng
     return eng
 
@@ -129,7 +177,8 @@ async def test_db_connection(target_url: str | None = None) -> tuple[bool, str]:
     if not url_to_test:
         return False, "Database URL not configured."
 
-    norm_url, _ = config.normalize_db_url(url_to_test)
+    resolved = resolve_masked_url(url_to_test)
+    norm_url, _ = config.normalize_db_url(resolved)
     temp_eng = create_async_engine(norm_url, poolclass=NullPool, pool_pre_ping=True)
     try:
         async with temp_eng.connect() as conn:
@@ -139,7 +188,7 @@ async def test_db_connection(target_url: str | None = None) -> tuple[bool, str]:
         return False, str(e)
     finally:
         try:
-            temp_eng.sync_engine.dispose()
+            await temp_eng.dispose()
         except Exception:
             pass
 
