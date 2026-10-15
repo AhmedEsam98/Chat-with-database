@@ -165,7 +165,7 @@ def build_db_url(
 # ---------------------------------------------------------------------------
 # Redis & Caching Settings
 # ---------------------------------------------------------------------------
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", os.getenv("REDIS_CACHE_TTL", "3600")))
